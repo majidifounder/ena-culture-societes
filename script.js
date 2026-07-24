@@ -13,24 +13,29 @@ var ICONS = {
 var AA = (typeof QUESTIONS_ART_ARCHITECTURE !== "undefined") ? QUESTIONS_ART_ARCHITECTURE : [];
 
 // ---------------------------------------------------------------
-// AI "Pourquoi je me suis trompé ?" — OPTIONAL, OFF by default.
+// AI "Pourquoi je me suis trompé ?" — OPTIONAL enhancement layered on top
+// of the rule-based explanation (which is always shown regardless).
 //
-// To wire a real backend later:
-//   1. Set AI_ENABLED = true.
-//   2. Set AI_ENDPOINT to your OWN server endpoint (never put a secret/API
-//      key directly in this file — this is a static site with no build
-//      step; anything here is public). Your server should hold the key
-//      and call the model itself.
-//   3. Your endpoint should accept a POST body of:
-//        { question, options, correctAnswer, userAnswer, explanation }
-//      and return JSON: { text: "..." } (a short 2-3 sentence string).
+// AI_ENDPOINT points at a small Vercel serverless function (see
+// api/explain.js) that holds the real Anthropic API key server-side, in
+// the ANTHROPIC_API_KEY environment variable — never in this file, which
+// is public static source. That function must be deployed separately
+// (it is NOT part of this static site's GitHub Pages build) and its own
+// env var configured in the Vercel project dashboard before it will
+// return real answers; until then it fails closed (HTTP 500) and the
+// button below just falls back to the message shown for any AI error.
 //
-// With AI_ENABLED left false (the default), no network request is ever
-// attempted — the rule-based explanation already shown is the only
-// explanation the app gives, and the app is 100% functional offline.
+// To point this at a different backend, set AI_ENDPOINT to any endpoint
+// accepting a POST body of:
+//   { question, options, correctAnswer, userAnswer, explanation }
+// and returning JSON: { text: "..." } (a short 2-3 sentence string).
+//
+// Set AI_ENABLED = false to disable the feature entirely — no network
+// request is then ever attempted, and the app remains 100% functional
+// offline with only the rule-based explanation.
 // ---------------------------------------------------------------
-var AI_ENABLED = false;
-var AI_ENDPOINT = ""; // e.g. "https://your-server.example.com/api/explain"
+var AI_ENABLED = true;
+var AI_ENDPOINT = "https://ena-ai-explain.vercel.app/api/explain";
 var AI_CACHE_KEY = "ena_ai_cache_v1";
 var aiExplanationCache = {};
 
@@ -555,17 +560,26 @@ function getAIExplanation(question, choiceIndex) {
     userAnswer: question.options[origIdx],
     explanation: question.explanation
   };
+
+  var controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  var timeoutId = controller ? setTimeout(function () { controller.abort(); }, 15000) : null;
+
   return fetch(AI_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    signal: controller ? controller.signal : undefined
   }).then(function (res) {
-    if (!res.ok) throw new Error("AI request failed");
+    if (timeoutId) clearTimeout(timeoutId);
+    if (!res.ok) throw new Error("AI request failed (" + res.status + ")");
     return res.json();
   }).then(function (data) {
     var text = (data && data.text) ? String(data.text).slice(0, 400) : "";
     if (!text) throw new Error("Empty AI response");
     return text;
+  }).catch(function (err) {
+    if (timeoutId) clearTimeout(timeoutId);
+    throw err;
   });
 }
 
