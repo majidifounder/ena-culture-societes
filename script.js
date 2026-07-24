@@ -4,8 +4,35 @@
 var STORAGE_KEY = "ena_trainer_v1";
 
 var ICONS = {
-  bulb: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2.3h6c0-1.1.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>'
+  bulb: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2.3h6c0-1.1.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>',
+  bulbSmall: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2.3h6c0-1.1.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>'
 };
+
+// Defensive merge of the optional "Art & Architecture" module file.
+// The app must keep working perfectly if questions-art-architecture.js is absent.
+var AA = (typeof QUESTIONS_ART_ARCHITECTURE !== "undefined") ? QUESTIONS_ART_ARCHITECTURE : [];
+
+// ---------------------------------------------------------------
+// AI "Pourquoi je me suis trompé ?" — OPTIONAL, OFF by default.
+//
+// To wire a real backend later:
+//   1. Set AI_ENABLED = true.
+//   2. Set AI_ENDPOINT to your OWN server endpoint (never put a secret/API
+//      key directly in this file — this is a static site with no build
+//      step; anything here is public). Your server should hold the key
+//      and call the model itself.
+//   3. Your endpoint should accept a POST body of:
+//        { question, options, correctAnswer, userAnswer, explanation }
+//      and return JSON: { text: "..." } (a short 2-3 sentence string).
+//
+// With AI_ENABLED left false (the default), no network request is ever
+// attempted — the rule-based explanation already shown is the only
+// explanation the app gives, and the app is 100% functional offline.
+// ---------------------------------------------------------------
+var AI_ENABLED = false;
+var AI_ENDPOINT = ""; // e.g. "https://your-server.example.com/api/explain"
+var AI_CACHE_KEY = "ena_ai_cache_v1";
+var aiExplanationCache = {};
 
 var LEVELS = [
   { min: 85, label: "Excellent", note: "Profil très compétitif." },
@@ -23,8 +50,9 @@ var state = {
   screen: "landing", // landing | exam | results | review
   settings: {
     scoring: "training", // "ena" (+1/-1/0) | "training" (+3/-1/0)
-    length: 300,          // 300 | 500
-    timer: true
+    length: 300,          // 300 | 500 (or module-specific length when moduleScope !== "all")
+    timer: true,
+    moduleScope: "all"    // "all" | "artArchitecture"
   },
   session: [],       // array of question objects (with _order attached)
   currentIndex: 0,
@@ -32,7 +60,7 @@ var state = {
   startTime: null,
   questionStartTime: null,
   elapsedBeforePause: 0,
-  reviewFilter: { status: "all", module: "all", search: "" },
+  reviewFilter: { status: "all", module: "all", subtheme: "all", search: "" },
   reviewOpenAll: false,
   hasSavedSession: false
 };
@@ -115,6 +143,19 @@ function elapsedSeconds() {
 // Session construction
 // ---------------------------------------------------------------
 
+function attachOrder(list) {
+  return list.map(function (q) {
+    var copy = Object.create(q);
+    copy._order = shuffle([0, 1, 2, 3]);
+    return copy;
+  });
+}
+
+// buildSession draws from the ORIGINAL question bank only (unchanged
+// behaviour) — the Art & Architecture add-on module is intentionally kept
+// out of the general "Toutes les matières" blend so it doesn't swamp the
+// existing, carefully weighted mix. Use buildArtArchitectureSession for a
+// dedicated Art & Architecture run.
 function buildSession(length) {
   var byModule = {};
   QUESTIONS.forEach(function (q) {
@@ -146,11 +187,17 @@ function buildSession(length) {
   }
 
   selected = shuffle(selected);
-  return selected.map(function (q) {
-    var copy = Object.create(q);
-    copy._order = shuffle([0, 1, 2, 3]);
-    return copy;
-  });
+  return attachOrder(selected);
+}
+
+function artArchitecturePool() {
+  return QUESTIONS.concat(AA).filter(function (q) { return q.module === "Art & Architecture"; });
+}
+
+function buildArtArchitectureSession(length) {
+  var pool = shuffle(artArchitecturePool());
+  var selected = pool.slice(0, Math.min(length, pool.length));
+  return attachOrder(selected);
 }
 
 function displayCorrectPos(q) { return q._order.indexOf(q.correctIndex); }
@@ -163,12 +210,16 @@ function renderLanding() {
   var saved = loadSavedSession();
   state.hasSavedSession = !!saved;
   var total = QUESTIONS.length;
+  var aaTotal = artArchitecturePool().length;
+  var scope = state.settings.moduleScope;
 
   var html = '';
   html += '<div class="hero">';
   html += '  <p class="eyebrow">Concours ENA · Culture &amp; Sociétés</p>';
   html += '  <h1>Entraînement QCM — Culture &amp; Sociétés</h1>';
-  html += '  <p class="lead">Banque de ' + total + ' questions vérifiées : institutions marocaines, organisations internationales, géographie, actualité 2024–2026, culture générale classique et architecture. 100% hors ligne, aucune donnée envoyée nulle part.</p>';
+  html += '  <p class="lead">Banque de ' + total + ' questions vérifiées : institutions marocaines, organisations internationales, géographie, actualité 2024–2026 et culture générale classique.'
+    + (aaTotal > 0 ? ' Un module dédié <b>Art &amp; Architecture</b> (' + aaTotal + ' questions) est aussi disponible séparément.' : '')
+    + ' 100% hors ligne, aucune donnée envoyée nulle part.</p>';
   html += '</div>';
 
   html += '<div class="card">';
@@ -185,11 +236,27 @@ function renderLanding() {
   html += '      </div>';
   html += '    </div>';
 
+  if (aaTotal > 0) {
+    html += '    <div class="setting-row">';
+    html += '      <span class="setting-label">Contenu</span>';
+    html += '      <div class="toggle-group" data-group="scope">';
+    html += '        <button type="button" class="toggle-option" data-value="all">Toutes les matières</button>';
+    html += '        <button type="button" class="toggle-option" data-value="artArchitecture">Art &amp; Architecture uniquement (' + aaTotal + ')</button>';
+    html += '      </div>';
+    html += '    </div>';
+  }
+
   html += '    <div class="setting-row">';
   html += '      <span class="setting-label">Longueur</span>';
   html += '      <div class="toggle-group" data-group="length">';
-  html += '        <button type="button" class="toggle-option" data-value="300">300 questions (examen)</button>';
-  html += '        <button type="button" class="toggle-option" data-value="' + total + '">' + total + ' questions (banque complète)</button>';
+  if (scope === "artArchitecture") {
+    var aaShort = Math.min(50, aaTotal);
+    html += '        <button type="button" class="toggle-option" data-value="' + aaShort + '">' + aaShort + ' questions</button>';
+    html += '        <button type="button" class="toggle-option" data-value="' + aaTotal + '">' + aaTotal + ' questions (module complet)</button>';
+  } else {
+    html += '        <button type="button" class="toggle-option" data-value="300">300 questions (examen)</button>';
+    html += '        <button type="button" class="toggle-option" data-value="' + total + '">' + total + ' questions (banque complète)</button>';
+  }
   html += '      </div>';
   html += '    </div>';
 
@@ -222,6 +289,16 @@ function renderLanding() {
       renderLanding();
     });
   });
+  $all('[data-group="scope"] .toggle-option').forEach(function (btn) {
+    btn.classList.toggle("active", btn.dataset.value === state.settings.moduleScope);
+    btn.addEventListener("click", function () {
+      state.settings.moduleScope = btn.dataset.value;
+      state.settings.length = state.settings.moduleScope === "artArchitecture"
+        ? Math.min(50, aaTotal)
+        : 300;
+      renderLanding();
+    });
+  });
   $all('[data-group="length"] .toggle-option').forEach(function (btn) {
     btn.classList.toggle("active", Number(btn.dataset.value) === state.settings.length);
     btn.addEventListener("click", function () {
@@ -246,7 +323,9 @@ function renderLanding() {
 
 function startNewExam() {
   clearProgress();
-  state.session = buildSession(state.settings.length);
+  state.session = state.settings.moduleScope === "artArchitecture"
+    ? buildArtArchitectureSession(state.settings.length)
+    : buildSession(state.settings.length);
   state.currentIndex = 0;
   state.answers = {};
   state.elapsedBeforePause = 0;
@@ -260,7 +339,7 @@ function resumeExam() {
   var data = loadSavedSession();
   if (!data) { startNewExam(); return; }
   var byId = {};
-  QUESTIONS.forEach(function (q) { byId[q.id] = q; });
+  QUESTIONS.concat(AA).forEach(function (q) { byId[q.id] = q; });
   state.session = data.sessionRefs.map(function (ref) {
     var copy = Object.create(byId[ref.id]);
     copy._order = ref.order;
@@ -398,13 +477,128 @@ function renderReveal(q, ans) {
     html += '  </ul>';
     html += '</div>';
 
-    html += '<div class="memory-callout">' + ICONS.bulb + '<span><b>Astuce mémoire —</b> ' + esc(q.memoryTrick) + '</span></div>';
+    if (q.memoryTrick) {
+      html += '<div class="memory-callout">' + ICONS.bulb + '<span><b>Astuce mémoire —</b> ' + esc(q.memoryTrick) + '</span></div>';
+    }
   }
 
   html += '<div class="source-line">Source : ' + esc(q.source) + '</div>';
 
+  if (!ans.skipped && !ans.correct) {
+    html += renderAIBlock(q, ans);
+  }
+
   return html;
 }
+
+// ---------------------------------------------------------------
+// AI "Pourquoi je me suis trompé ?" — rendering + wiring
+// (fallback-first: the rule-based explanation above is always shown;
+// this block is a purely optional, on-demand enhancement)
+// ---------------------------------------------------------------
+
+function renderAIBlock(q, ans) {
+  var key = q.id + "::" + ans.pickedPos;
+  var cached = getCachedAIExplanation(key);
+  var html = '<div class="ai-block">';
+  html += '<button type="button" class="btn btn-ghost ai-explain-btn" data-qid="' + q.id + '" data-choice="' + ans.pickedPos + '">' + ICONS.bulbSmall + ' Pourquoi je me suis trompé ? (IA)</button>';
+  html += '<div class="ai-panel"' + (cached ? '' : ' hidden') + ' data-ai-panel="' + esc(key) + '">' + (cached ? esc(cached) : '') + '</div>';
+  html += '</div>';
+  return html;
+}
+
+function findQuestionById(id) {
+  var inSession = state.session.filter(function (q) { return q.id === id; })[0];
+  if (inSession) return inSession;
+  return QUESTIONS.concat(AA).filter(function (q) { return q.id === id; })[0];
+}
+
+function getCachedAIExplanation(key) {
+  if (aiExplanationCache[key]) return aiExplanationCache[key];
+  try {
+    var raw = localStorage.getItem(AI_CACHE_KEY);
+    if (raw) {
+      var store = JSON.parse(raw);
+      if (store && store[key]) { aiExplanationCache[key] = store[key]; return store[key]; }
+    }
+  } catch (e) { /* localStorage unavailable — ignore silently */ }
+  return null;
+}
+
+function setCachedAIExplanation(key, text) {
+  aiExplanationCache[key] = text;
+  try {
+    var raw = localStorage.getItem(AI_CACHE_KEY);
+    var store = raw ? JSON.parse(raw) : {};
+    store[key] = text;
+    localStorage.setItem(AI_CACHE_KEY, JSON.stringify(store));
+  } catch (e) { /* localStorage unavailable — ignore silently */ }
+}
+
+function showAIPanel(panel, text) {
+  panel.hidden = false;
+  panel.textContent = text;
+}
+
+// getAIExplanation — the ONLY function that ever touches the network, and
+// only when explicitly enabled above AND the user clicks the button on a
+// wrong answer. Never called automatically, never called for correct or
+// skipped answers, never called twice for the same question+choice (the
+// caller checks the cache first).
+function getAIExplanation(question, choiceIndex) {
+  if (!AI_ENABLED || !AI_ENDPOINT) return Promise.reject(new Error("AI disabled"));
+  var origIdx = (question._order ? question._order[choiceIndex] : choiceIndex);
+  var payload = {
+    question: question.question,
+    options: question.options,
+    correctAnswer: question.options[question.correctIndex],
+    userAnswer: question.options[origIdx],
+    explanation: question.explanation
+  };
+  return fetch(AI_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(function (res) {
+    if (!res.ok) throw new Error("AI request failed");
+    return res.json();
+  }).then(function (data) {
+    var text = (data && data.text) ? String(data.text).slice(0, 400) : "";
+    if (!text) throw new Error("Empty AI response");
+    return text;
+  });
+}
+
+function handleAIButtonClick(btn) {
+  var qid = Number(btn.dataset.qid);
+  var choice = Number(btn.dataset.choice);
+  var key = qid + "::" + choice;
+  var panel = document.querySelector('[data-ai-panel="' + key + '"]');
+  if (!panel) return;
+
+  var cached = getCachedAIExplanation(key);
+  if (cached) { showAIPanel(panel, cached); return; }
+
+  if (!AI_ENABLED || !AI_ENDPOINT) {
+    showAIPanel(panel, "IA indisponible – explication de secours affichée ci-dessus.");
+    return;
+  }
+
+  showAIPanel(panel, "Chargement…");
+  var q = findQuestionById(qid);
+  getAIExplanation(q, choice).then(function (text) {
+    setCachedAIExplanation(key, text);
+    showAIPanel(panel, text);
+  }).catch(function () {
+    showAIPanel(panel, "IA indisponible – explication de secours affichée ci-dessus.");
+  });
+}
+
+document.addEventListener("click", function (e) {
+  var btn = e.target.closest ? e.target.closest(".ai-explain-btn") : null;
+  if (!btn) return;
+  handleAIButtonClick(btn);
+});
 
 function upToIndex(q) { return state.session.indexOf(q); }
 
@@ -601,7 +795,7 @@ function renderResults() {
 
   $all(".jump-subject").forEach(function (btn) {
     btn.addEventListener("click", function () {
-      state.reviewFilter = { status: "all", module: "all", search: btn.dataset.subject };
+      state.reviewFilter = { status: "all", module: "all", subtheme: "all", search: btn.dataset.subject };
       state.reviewOpenAll = false;
       state.screen = "review";
       render();
@@ -609,7 +803,7 @@ function renderResults() {
   });
 
   $("#btn-review").addEventListener("click", function () {
-    state.reviewFilter = { status: "all", module: "all", search: "" };
+    state.reviewFilter = { status: "all", module: "all", subtheme: "all", search: "" };
     state.reviewOpenAll = false;
     state.screen = "review";
     render();
@@ -632,6 +826,8 @@ function questionStatus(q) {
   return a.correct ? "correct" : "wrong";
 }
 
+function subthemeOf(q) { return q.subtheme || q.subject; }
+
 function filteredReviewItems() {
   var f = state.reviewFilter;
   var search = (f.search || "").toLowerCase();
@@ -641,6 +837,7 @@ function filteredReviewItems() {
     if (f.status === "unanswered" && status !== "unanswered") return false;
     if (f.status === "correct" && status !== "correct") return false;
     if (f.module !== "all" && q.module !== f.module) return false;
+    if (f.subtheme && f.subtheme !== "all" && subthemeOf(q) !== f.subtheme) return false;
     if (search) {
       var hay = (q.question + " " + q.subject + " " + q.module).toLowerCase();
       if (hay.indexOf(search) === -1) return false;
@@ -651,6 +848,7 @@ function filteredReviewItems() {
 
 function renderReview() {
   var modules = Array.from(new Set(state.session.map(function (q) { return q.module; })));
+  var subthemes = Array.from(new Set(state.session.map(subthemeOf))).sort();
   var items = filteredReviewItems();
 
   var html = '';
@@ -664,6 +862,12 @@ function renderReview() {
   html += '<option value="all">Tous les modules</option>';
   modules.forEach(function (m) {
     html += '<option value="' + esc(m) + '"' + (state.reviewFilter.module === m ? " selected" : "") + '>' + esc(m) + '</option>';
+  });
+  html += '</select>';
+  html += '<select id="subtheme-filter">';
+  html += '<option value="all">Tous les sujets</option>';
+  subthemes.forEach(function (s) {
+    html += '<option value="' + esc(s) + '"' + (state.reviewFilter.subtheme === s ? " selected" : "") + '>' + esc(s) + '</option>';
   });
   html += '</select>';
   html += '<input type="search" id="search-input" placeholder="Rechercher dans les questions…" value="' + esc(state.reviewFilter.search) + '">';
@@ -710,8 +914,13 @@ function renderReview() {
     html += '      </ul>';
     html += '    </div>';
 
-    html += '    <div class="memory-callout">' + ICONS.bulb + '<span><b>Astuce mémoire —</b> ' + esc(q.memoryTrick) + '</span></div>';
+    if (q.memoryTrick) {
+      html += '    <div class="memory-callout">' + ICONS.bulb + '<span><b>Astuce mémoire —</b> ' + esc(q.memoryTrick) + '</span></div>';
+    }
     html += '    <div class="source-line">Source : ' + esc(q.source) + '</div>';
+    if (a && !a.skipped && !a.correct) {
+      html += renderAIBlock(q, a);
+    }
     html += '  </div>';
     html += '</details>';
   });
@@ -726,6 +935,10 @@ function renderReview() {
   });
   $("#module-filter").addEventListener("change", function (e) {
     state.reviewFilter.module = e.target.value;
+    render();
+  });
+  $("#subtheme-filter").addEventListener("change", function (e) {
+    state.reviewFilter.subtheme = e.target.value;
     render();
   });
   var searchInput = $("#search-input");
